@@ -180,10 +180,14 @@ int crsf_port = -1;  // Порт для CRSF, -1 если не использу�
 const uint8_t CRSF_BATTERY_SENSOR = 0x08;
 const uint8_t CRSF_ATTITUDE_TYPE = 0x1E;
 const uint8_t CRSF_FRAMETYPE_FLIGHT_MODE = 0x21;
+const double RAD_TO_DEG = 57.2957795131;               // Коэффициент для перевода радианов в градусы
+const double CONVERSION_FACTOR = RAD_TO_DEG / 10000.0; // Специфический коэффициент преобразования, используемый в протоколе
 
 
 float crsf_battery_voltage = 0.0;
 float crsf_battery_current = 0.0;
+float crsf_battery_capacity = 0.0;
+float crsf_remaining = 0.0;
 float crsf_pitch = 0.0;
 float crsf_roll = 0.0;
 float crsf_yaw = 0.0;
@@ -222,10 +226,12 @@ void handleCrsfPacket(uint8_t ptype, const uint8_t* data, size_t length) {
     if (ptype == CRSF_BATTERY_SENSOR) {
         crsf_battery_voltage = (data[3] << 8 | data[4]) / 10.0;
         crsf_battery_current = (data[5] << 8 | data[6]) / 10.0;
+        crsf_battery_capacity =  (float)((data[7] << 16) | (data[8] << 8) | data[9]);
+        crsf_remaining = (float)(data[10]);
     } else if (ptype == CRSF_ATTITUDE_TYPE) {
-        crsf_pitch = (int16_t)(data[3] << 8 | data[4]) / 10000.0;
-        crsf_roll = (int16_t)(data[5] << 8 | data[6]) / 10000.0;
-        crsf_yaw = (int16_t)(data[7] << 8 | data[8]) / 10000.0;
+        crsf_pitch = (int16_t)(data[3] << 8 | data[4]) * CONVERSION_FACTOR;
+        crsf_roll = (int16_t)(data[5] << 8 | data[6]) * CONVERSION_FACTOR;
+        crsf_yaw = (int16_t)(data[7] << 8 | data[8]) * CONVERSION_FACTOR;
     } else if (ptype == CRSF_FRAMETYPE_FLIGHT_MODE) {
         int mode_length = data[1] - 3;
         if (mode_length > 0 && mode_length < 256) {
@@ -1478,18 +1484,19 @@ void* crsfThread(void* arg) {
 
 
 void* crsfOsdThread(void* arg) {
-    puts("Start OSD");
     struct _fbg* fbg = fbg_fbdevSetup(NULL, HI_FALSE, vo_width, vo_height);
     if (!fbg) {
         fprintf(stderr, "Ошибка: не удалось инициализировать OSD\n");
         return NULL;
     }
-   puts("Started OSD");
+    int hours = 0 , minutes = 0 , seconds = 0 , milliseconds = 0;
     struct _fbg_img* bb_font_img = fbg_loadPNGFromMemory(fbg, font_14_23, 26197);
     struct _fbg_font* bbfont = fbg_createFont(fbg, bb_font_img, 14, 23, 33);
     struct _fbg_img* openipc_img = fbg_loadPNGFromMemory(fbg, openipc, 11761);
 
     double resX_multiplier = 1;
+    uint32_t x_center = fbg->width / 2;
+    uint32_t y_center = fbg->height / 2;
     double resY_multiplier = 1;
     if (fbg->height == 1080) {
         resX_multiplier = 1.5;
@@ -1499,23 +1506,91 @@ void* crsfOsdThread(void* arg) {
     char msg[64];
 
     while (1) {
-	puts("Started OSD LOOP");
         fbg_clear(fbg, 0);  // Очистка экрана
-	fbg_draw(fbg);
-        // Наложение данных о батарее
-        sprintf(msg, "Battery: %.2fV %.1fA", crsf_battery_voltage, crsf_battery_current);
-        fbg_write(fbg, msg, 10, 10);
+	      fbg_draw(fbg);
 
-        // Наложение данных об ориентации
-        sprintf(msg, "Attitude: Pitch=%.2f Roll=%.2f Yaw=%.2f", crsf_pitch, crsf_roll, crsf_yaw);
-        fbg_write(fbg, msg, 10, 30);
+        sprintf(msg, "%.02fV", crsf_battery_voltage);
+        if (osd_element4x > 0){fbg_write(fbg, msg, osd_element4x, osd_element4y*resY_multiplier);}
+        sprintf(msg, "%.00fmAh", crsf_battery_capacity);
+        if (osd_element5x > 0){fbg_write(fbg, msg, osd_element5x, osd_element5y*resY_multiplier);}
+        sprintf(msg, "%.02fA", crsf_battery_current);
+        if (osd_element6x > 0){fbg_write(fbg, msg, osd_element6x, osd_element6y*resY_multiplier);}
+        sprintf(msg, "%.02f%%", crsf_remaining);
+        if (osd_element7x > 0){fbg_write(fbg, msg, osd_element7x, osd_element7y*resY_multiplier);}
 
-        // Наложение режима полета
+        // Print rate stats
+        struct timespec current_timestamp;
+        if (!clock_gettime(CLOCK_MONOTONIC_COARSE, &current_timestamp)) {
+          double interval = getTimeInterval(&current_timestamp, &last_timestamp);
+          if (telemetry_arm > 1700){
+            seconds = seconds + interval;
+          }
+          if (interval > 1) {
+            last_timestamp = current_timestamp;
+            rx_rate = ((float)stats_rx_bytes+(((float)stats_rx_bytes*25)/100)) / 1024.0f * 8;
+            stats_rx_bytes = 0;
+          }
+        }
+
+        char hud_frames_rx[32];
+
+        memset(hud_frames_rx, 0, sizeof(hud_frames_rx));
+        sprintf(hud_frames_rx, "Rate %.02f Kbit/s", rx_rate);
+        if (osd_element16x > 0){fbg_write(fbg, hud_frames_rx, osd_element15x*resX_multiplier, osd_element15y*resY_multiplier);}
+        if(seconds > 59){
+           seconds = 0;
+           ++minutes;
+        }
+        if(minutes > 59){
+           seconds = 0;
+           minutes = 0;
+        }
+        float percent = rx_rate / (1024 * 10);
+        if (percent > 1) {
+          percent = 1;
+        }
+        uint32_t width = (strlen(hud_frames_rx) * 16) * percent;
+        fbg_rect(fbg, (osd_element15x*resX_multiplier)-25, (osd_element15y*resY_multiplier)+25, width, 5, 255, 255, 255);
+
+        // // Наложение данных о батарее
+        // sprintf(msg, "Battery: %.2fV %.1fA", crsf_battery_voltage, crsf_battery_current);
+        // fbg_write(fbg, msg, 10, 10);
+
+        // // Наложение данных об ориентации
+        // sprintf(msg, "Attitude: Pitch=%.2f Roll=%.2f Yaw=%.2f", crsf_pitch, crsf_roll, crsf_yaw);
+        // fbg_write(fbg, msg, 10, 30);
+
         sprintf(msg, "Flight Mode: %s", crsf_flight_mode);
-        fbg_write(fbg, msg, 10, 50);
+        if (osd_element15x > 0){fbg_write(fbg, msg, 20*resX_multiplier, osd_element15y*resY_multiplier);}
 
+
+        sprintf(msg, "YAW:%.00f", crsf_yaw);
+        if (osd_element10x > 0){fbg_write(fbg, msg, osd_element10x*resX_multiplier, osd_element10y*resY_multiplier);}
+        sprintf(msg, "ROLL:%.00f", crsf_roll);
+        if (osd_element11x > 0){fbg_write(fbg, msg, osd_element11x*resX_multiplier, osd_element11y*resY_multiplier);}
+        sprintf(msg, "PITCH:%.00f", crsf_pitch);
+        if (osd_element12x > 0){fbg_write(fbg, msg, osd_element12x*resX_multiplier, osd_element12y*resY_multiplier);}
+
+        if (rx_rate < 0.00001) {
+          sprintf(msg, "%s", "No video signal");
+          fbg_write(fbg, msg, x_center - 100, y_center);
+        } 
+
+
+        int32_t offset_pitch = crsf_pitch * 4;
+        int32_t offset_roll = crsf_roll * 4;
+        int32_t y_pos_left = ((int32_t)fbg->height / 2 - osd_element18x*resX_multiplier + offset_pitch + offset_roll);
+        int32_t y_pos_right = ((int32_t)fbg->height / 2 - osd_element18x*resY_multiplier + offset_pitch - offset_roll);
+
+        for (int i = 0; i < 4; i++) {
+          if (y_pos_left > 0 && y_pos_left < fbg->height &&
+            y_pos_right > 0 && y_pos_right < fbg->height) {
+            fbg_line(fbg, x_center - 180, y_pos_left + i,
+              x_center + 180, y_pos_right + i, 255, 255, 255);
+          }
+        }
         fbg_flip(fbg);  // Обновление дисплея
-        usleep(100000);  // Обновление каждые 100 мс
+        usleep(1);
     }
 
     // Освобождение ресурсов
