@@ -100,3 +100,5 @@ uint8_t* decode_frame(uint8_t* rx_buffer, uint32_t rx_size,
 
 void* __OSD_THREAD__(void*);
 void* __MAVLINK_THREAD__(void*);
+void* crsfThread(void*);
+void* crsfOsdThread(void*);

@@ -1,5 +1,6 @@
 #include "main.h"
 #include "recorder.h"
+#include <stdint.h>
 
 #define earthRadiusKm 6371.0
 typedef struct hiHDMI_ARGS_S {
@@ -173,6 +174,67 @@ struct timespec last_timestamp = {0, 0};
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
   return (timestamp->tv_sec - last_meansure_timestamp->tv_sec) +
        (timestamp->tv_nsec - last_meansure_timestamp->tv_nsec) / 1000000000.;
+}
+
+int crsf_port = -1;  // Порт для CRSF, -1 если не используется
+const uint8_t CRSF_BATTERY_SENSOR = 0x08;
+const uint8_t CRSF_ATTITUDE_TYPE = 0x1E;
+const uint8_t CRSF_FRAMETYPE_FLIGHT_MODE = 0x21;
+
+
+float crsf_battery_voltage = 0.0;
+float crsf_battery_current = 0.0;
+float crsf_pitch = 0.0;
+float crsf_roll = 0.0;
+float crsf_yaw = 0.0;
+char crsf_flight_mode[256] = "";
+
+uint8_t crc8_dvb_s2(uint8_t crc, uint8_t a) {
+    crc ^= a;
+    for (int i = 0; i < 8; i++) {
+        if (crc & 0x80) {
+            crc = (crc << 1) ^ 0xD5;
+        } else {
+            crc <<= 1;
+        }
+    }
+    return crc & 0xFF;
+}
+
+uint8_t crc8_data(const uint8_t* data, size_t length) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < length; i++) {
+        crc = crc8_dvb_s2(crc, data[i]);
+    }
+    return crc;
+}
+
+int crsf_validate_frame(const uint8_t* frame, size_t length) {
+    if (length < 4) {
+        return 0; // Недостаточная длина
+    }
+    uint8_t calculated_crc = crc8_data(frame + 2, length - 3);
+    uint8_t received_crc = frame[length - 1];
+    return calculated_crc == received_crc;
+}
+
+void handleCrsfPacket(uint8_t ptype, const uint8_t* data, size_t length) {
+    if (ptype == CRSF_BATTERY_SENSOR) {
+        crsf_battery_voltage = (data[3] << 8 | data[4]) / 10.0;
+        crsf_battery_current = (data[5] << 8 | data[6]) / 10.0;
+    } else if (ptype == CRSF_ATTITUDE_TYPE) {
+        crsf_pitch = (int16_t)(data[3] << 8 | data[4]) / 10000.0;
+        crsf_roll = (int16_t)(data[5] << 8 | data[6]) / 10000.0;
+        crsf_yaw = (int16_t)(data[7] << 8 | data[8]) / 10000.0;
+    } else if (ptype == CRSF_FRAMETYPE_FLIGHT_MODE) {
+        int mode_length = data[1] - 3;
+        if (mode_length > 0 && mode_length < 256) {
+            memcpy(crsf_flight_mode, &data[3], mode_length);
+            crsf_flight_mode[mode_length] = '\0'; // Завершение строки
+        } else {
+            strcpy(crsf_flight_mode, "Unknown");
+        }
+    }
 }
 
 uint16_t osd_element1x = 0;
@@ -522,7 +584,12 @@ int main(int argc, const char* argv[]) {
     osd_element19y = atoi(__ArgValue);
     continue;
   }
-  
+
+
+__OnArgument("--crsf") {
+    crsf_port = atoi(__ArgValue);
+    continue;
+}
 
   __OnArgument("--ar") {
     const char* mode = __ArgValue;
@@ -886,10 +953,17 @@ int main(int argc, const char* argv[]) {
   }
 
   // Start ISP service thread
-  pthread_t osd_thread;
+  pthread_t osd_thread, crsf_thread;
   if (enable_osd) {
+    if (crsf_port != -1) {
+    // Запуск потоков CRSF
+    pthread_create(&crsf_thread, NULL, crsfThread, 0);
+    pthread_create(&osd_thread, NULL, crsfOsdThread, 0);
+  } else {
+    // Запуск стандартных потоков OSD и MAVLink
     pthread_create(&osd_thread, NULL, __OSD_THREAD__, 0);
     pthread_create(&osd_thread, NULL, __MAVLINK_THREAD__, 0);
+  }
   }
 
   uint32_t write_buffer_capacity = 1024 * 1024 * 2;
@@ -1339,4 +1413,116 @@ void* __OSD_THREAD__(void* arg) {
     fbg_flip(fbg);
     usleep(1);
   }
+}
+
+
+void* crsfThread(void* arg) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        perror("Ошибка: не удалось создать сокет CRSF");
+        return NULL;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(crsf_port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("Ошибка: не удалось привязать сокет CRSF");
+        close(sock);
+        return NULL;
+    }
+
+    uint8_t input[4096];
+    size_t input_len = 0;
+
+    while (1) {
+        ssize_t len_received = recv(sock, input + input_len, sizeof(input) - input_len, 0);
+        if (len_received > 0) {
+            input_len += len_received;
+
+            while (input_len > 2) {
+                size_t expected_len = input[1] + 2;
+                if (expected_len > 64 || expected_len < 4) {
+                    printf("Invalid packet length: %zu. Resetting buffer.\n", expected_len);
+                    input_len = 0;
+                } else if (input_len >= expected_len) {
+                    uint8_t single[64];
+                    memcpy(single, input, expected_len);
+                    memmove(input, input + expected_len, input_len - expected_len);
+                    input_len -= expected_len;
+
+                    if (!crsf_validate_frame(single, expected_len)) {
+                        printf("CRC error\n");
+                    } else {
+                        handleCrsfPacket(single[2], single, expected_len);
+                    }
+                } else {
+                    break; // Не хватает данных для полного пакета, ждем больше
+
+
+
+}
+            }
+        } else if (len_received < 0) {
+            perror("Ошибка при получении данных");
+        }
+        usleep(1000); // Ожидание
+    }
+
+    close(sock);
+    return NULL;
+}
+
+
+void* crsfOsdThread(void* arg) {
+    puts("Start OSD");
+    struct _fbg* fbg = fbg_fbdevSetup(NULL, HI_FALSE, vo_width, vo_height);
+    if (!fbg) {
+        fprintf(stderr, "Ошибка: не удалось инициализировать OSD\n");
+        return NULL;
+    }
+   puts("Started OSD");
+    struct _fbg_img* bb_font_img = fbg_loadPNGFromMemory(fbg, font_14_23, 26197);
+    struct _fbg_font* bbfont = fbg_createFont(fbg, bb_font_img, 14, 23, 33);
+    struct _fbg_img* openipc_img = fbg_loadPNGFromMemory(fbg, openipc, 11761);
+
+    double resX_multiplier = 1;
+    double resY_multiplier = 1;
+    if (fbg->height == 1080) {
+        resX_multiplier = 1.5;
+        resY_multiplier = 1.5;
+    }
+
+    char msg[64];
+
+    while (1) {
+	puts("Started OSD LOOP");
+        fbg_clear(fbg, 0);  // Очистка экрана
+	fbg_draw(fbg);
+        // Наложение данных о батарее
+        sprintf(msg, "Battery: %.2fV %.1fA", crsf_battery_voltage, crsf_battery_current);
+        fbg_write(fbg, msg, 10, 10);
+
+        // Наложение данных об ориентации
+        sprintf(msg, "Attitude: Pitch=%.2f Roll=%.2f Yaw=%.2f", crsf_pitch, crsf_roll, crsf_yaw);
+        fbg_write(fbg, msg, 10, 30);
+
+        // Наложение режима полета
+        sprintf(msg, "Flight Mode: %s", crsf_flight_mode);
+        fbg_write(fbg, msg, 10, 50);
+
+        fbg_flip(fbg);  // Обновление дисплея
+        usleep(100000);  // Обновление каждые 100 мс
+    }
+
+    // Освобождение ресурсов
+    fbg_freeFont(bbfont);
+    fbg_freeImage(bb_font_img);
+    fbg_freeImage(openipc_img);
+    fbg_close(fbg);
+
+    return NULL;
 }
